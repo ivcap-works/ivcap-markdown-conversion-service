@@ -1,0 +1,26 @@
+[project]
+name = "ivcap-python-ai-tool-template"
+version = "0.2.2"
+description = "AI tool to help determining if a number is a prime number."
+authors = [
+    {name = "Max Ott",email = "max.ott@data61.csiro.au"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "ivcap-ai-tool (>=0.7.15,<0.8.0)",
+    "pydantic (>=2.11.4,<3.0.0)"
+]
+
+[tool.poetry-plugin-ivcap]
+service-file = "tool-service.py"
+# service-id = "urn:ivcap:service:227e9443-3de1-5d62-91e5-12a375afb002"
+service-type = "lambda"
+# policy = "urn:ivcap:policy:ivcap.open.metadata"
+port = 8078
+# docker
+docker-run-opts = []
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
