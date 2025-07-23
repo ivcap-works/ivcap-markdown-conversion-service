@@ -80,8 +80,9 @@ def conversion_service(req: Request, ctxt: JobContext) -> Result:
     cl = list(ivcap.list_aspects(entity=req.document, schema=Result.SCHEMA, limit=1))
     cached = cl[0] if cl else None
     if cached:
-        logger.info(f"Using cached document: {cached.markdown_urn}")
-        return Result(markdown_urn=cached.markdown_urn) # should be able to simply return "cached"
+        content = cached.content
+        logger.info(f"Using cached document: {content['markdown_urn']}")
+        return Result(**content) # should be able to simply return "cached"
 
     # 2. Download the source document
     logger.info(f"Converting document: {req.document}")
