@@ -1,98 +1,149 @@
-# IVCAP "AI Tool" Demo
+# Tutorial: Working with Artifacts and the Datafabric
 
-> __Note:__ This is template repository to help you get started with building a new service for the IVCAP platform. If you are still unfamilar with
-IVCAP, you may want to first checkout the [Gene Ontology (GO) Term Mapper](https://github.com/ivcap-works/gene-onology-term-mapper) tutorial.
+> Please note, that this tutorial assumes that you already familiar with
+the basics of developing and deploying IVCAP services. If not, you may first
+check out the [Building a Gene Ontology (GO) Term Mapper Tool](https://github.com/ivcap-works/gene-onology-term-mapper) tutorial
 
-This repo template contains an implementation of a
-basic _AI Agent Tool_ usable for various agent frameworks
-like [crewAI](https://www.crewai.com).
+In this tutorial we will implement a text format conversation service which creates
+a Markdown version of a PDF document. Both versions will be stored as IVCAP `artifacts` and
+linked together by an IVCAP `aspect`.
 
-The actual tool implemented in ths repo provides a simple test if a provided
-number is a prime number or not.
+![setup](setup.excalidraw.svg)
 
-* [Use](#use)
-* [Test](#test)
-* [Build & Deploy](#build)
-* [Implementation](#implementation)
+More precisely, the service will perform the following steps:
 
-## Use <a name="test"></a>
+1. Check if there is already a cached conversation of the document, if yes, return that immediately
+2. Downloads the source document from IVCAP storage
+3. Converts the document using [MarkItDown](https://github.com/microsoft/markitdown) with plugin support
+4. Uploads the generated markdown back to IVCAP storage as `artifact`.
+5. Returns the URI of the uploaded markdown file (which will be stored as `aspect` in the _DataFabric_)
 
-Below is an example of an agent query which uses this tool:
-```
+## Example Output
+
+```bash
+% poetry ivcap job-exec tests/request.json -- --timeout 0
+...
 {
-  "$schema": "urn:sd-core:schema:llama-agent.request.1",
-  "name": "Agent query test",
-  "msg": "is 997 a prime number?",
-  "tools": [
-    "urn:sd-core:ai-tool:is_prime"
-  ],
-  "verbose": true
+  ...
+  "result-content": {
+    "$id": "urn:ivcap:artifact:09e0cb8c-d03f-46cd-bc20-5f269d9d0401",
+    "$policy": "urn:ivcap:policy:ivcap.base.artifact",
+    "$schema": "urn:sd:schema.markdown-conversion.1",
+    "markdown_urn": "urn:ivcap:artifact:ea6e74d0-17ce-4947-8022-e038c750c35d"
+  },
+  "result-content-type": "application/vnd.ivcap.urn:sd:schema.markdown-conversion.1",
+  ...
+  "status": "succeeded"
 }
 ```
 
-## Setup
+## Implementation - [conversion_service.py](./conversion_service.py)
 
-1. Clone the repository
-1. Install `poetry` and add the `ivcap` plugin:
-   ```bash
-   pip install poetry
-   poetry self add poetry-plugin-ivcap
-   ```
-1. Install the IVCAP cli tool. Instructions can be found [following this link](https://github.com/ivcap-works/ivcap-cli?tab=readme-ov-file#install-released-binaries).
-1. Install dependencies:
-   ```bash
-   poetry install --no-root
-   ```
+As usual, we start with declaring the expected request and the reply of the service
 
-## Test <a name="test"></a>
+```python
+class Request(BaseModel):
+    SCHEMA: ClassVar[str] = "urn:sd:schema.markdown-conversion.request.2"
+    jschema: str = Field(SCHEMA, alias="$schema")
+    document: str = Field(description="IVCAP URN of the file to parse")
+    policy: Optional[str] = Field("urn:ivcap:policy:ivcap.base.artifact", description="policy for the created markdown artifact")
 
-In order to quickly test this service, follow these steps:
-
-* `poetry ivcap run`
-
-```
-% poetry ivcap run
-Running: poetry run python tool-service.py --port 8078
-2025-05-28T16:24:14+1000 INFO (app): AI tool to check for prime numbers - 0.2.0|b4dbd44|2025-05-28T16:24:13+10:00 - v0.7.2
-2025-05-28T16:24:14+1000 INFO (uvicorn.error): Started server process [6311]
-2025-05-28T16:24:14+1000 INFO (uvicorn.error): Waiting for application startup.
-2025-05-28T16:24:14+1000 INFO (uvicorn.error): Application startup complete.
-2025-05-28T16:24:14+1000 INFO (uvicorn.error): Uvicorn running on http://0.0.0.0:8078 (Press CTRL+C to quit)
+class Result(BaseModel):
+    SCHEMA: ClassVar[str] = "urn:sd:schema.markdown-conversion.1"
+    jschema: str = Field(SCHEMA, alias="$schema")
+    id: str = Field(..., alias="$id")
+    markdown_urn: str = Field(description="URN of the markdown version of the uploaded document.")
+    policy: Optional[str] = Field(None, alias="$policy", description="Policy of the created markdown artifact.")
 ```
 
-In a separate terminal, call the service via `make test-local` or your favorite http testing tool:
+As mentioned above the service, implemented by the `conversion_service` method performs the following steps:
+
+1. [Check if there is already a cached conversation of the document, if yes, return that immediately](#step1)
+2. [Downloads the source document from IVCAP storage](#step2)
+3. [Converts the document using `MarkItDown`](#step3)
+4. [Uploads the generated markdown back to IVCAP storage as `artifact`.](#step4)
+5. [Return the service result containing the URI of the 'markdown' artifact](#step5)
+
+### Step 1: Check for already existing conversion <a name="step1"></a>
+
+The `ctxt: JobContext`, passed into the service function, contains a reference to an already configured
+[IVCAP](https://ivcap-works.github.io/ivcap-client-sdk-python/autoapi/ivcap_client/index.html#ivcap_client.IVCAP) instance reference from the [IVCAP Client SDK](https://ivcap-works.github.io/ivcap-client-sdk-python/index.html).
+
+With it, we can query for a previous result for the requested PDF document (`req.document`). As the result of every job
+is being added to the IVCAP **DataFabric** as an `aspect`, we can also try to retrieve it with `ivcap.list_aspects(entity=req.document, schema=Result.SCHEMA, ...)`. If it already exists, we can simply return it.
+
+```python
+# 1. Check for cached conversion
+ivcap = ctxt.ivcap
+cl = list(ivcap.list_aspects(entity=req.document, schema=Result.SCHEMA, limit=1))
+cached = cl[0] if cl else None
+if cached:
+    content = cached.content
+    logger.info(f"Using cached document: {content['markdown_urn']}")
+    return Result(**content) # should be able to simply return "cached"
 ```
-% make test-local
-curl -i -X POST \
-    -H "content-type: application/json" \
-    --data @tests/request.json \
-    http://localhost:8078
-HTTP/1.1 200 OK
-date: Tue, 22 Jul 2025 06:32:39 GMT
-server: uvicorn
-job-id: urn:ivcap:job:1f066c5a-a3b4-6f84-a5f7-9eae9cc90b25
-content-length: 67
-content-type: application/json
-ivcap-ai-tool-version: 0.7.15
 
-{"$schema":"urn:sd:schema.is-prime.1","number":997,"is_prime":true}
+### Step 2: Downloads the source document from IVCAP storage <a name="step2"></a>
+
+
+If the requested document has not been converted, or we do not have sufficient permissions to retrieve it, we now need
+to first retrieve the respective _artifact_ record for the requested document and then obtain a _file-like_ handle to
+its content
+
+```python
+# 2. Download the source document
+doc = ivcap.get_artifact(req.document)
+doc_f = doc.as_file()
 ```
 
-A more "web friendly" way is to open [http://localhost:8078/api](http://localhost:8078/api)
+### Step 3. Converts the document <a name="step3"></a>
 
-<img src="openapi.png" width="400"/>
+After obtaining a reference to the document content, we can call the `convert` function of the
+[MarkItDown](https://github.com/microsoft/markitdown) library
 
-## Build & Deploy <a name="build"></a>
+```python
+# 3. Convert the document to markdown
+converter = MarkItDown(enable_plugins=True)
+cres = converter.convert(doc_f, stream_info=StreamInfo(mimetype=doc.mime_type))
+if not cres:
+    raise ValueError(f"Failed to convert document '{req.document}' to markdown.")
+md = cres.markdown
+```
 
-The tool needs to be packed into a docker container, and the, together with an IVCAP service description
-deployed to an IVCAP platform.
+### Step 4: Uploads the generated markdown back to IVCAP storage as `artifact` <a name="step4"></a>
 
-> **Important**: If you adopt this repo template, please make sure to first change the first two variables
-`SERVICE_NAME` and `SERVICE_TITLE` at the top of the [Makefile](./Makefile).
+With the converted markdown text stored in `md`, we can now upload it as an IVCAP _artifact_
+with the record details assigned to `cart`.
 
+```python
+# 4.Upload the generated markdown to IVCAP storage
+ms = io.BytesIO(md.encode("utf-8"))
+cart = ivcap.upload_artifact(
+    name=f"{doc.name}.md",
+    io_stream=ms,
+    content_type="text/markdown",
+    content_size=len(md),
+    policy=req.policy,
+)
+logger.info(f"Uploaded markdown to {cart.urn}")
+```
 
-> **Note:** Please make sure to have the IVCAP cli tool installed and configured. See the
-[ivcap-cli](https://github.com/ivcap-works/ivcap-cli) repo for more details.
+### Step 5: Return the service result containing the URI of the 'markdown' artifact <a name="step5"></a>
+
+Finally, we create a `Result` instance and return from teh service function. Please note, that
+this record is stored as an aspect in the _IVCAP DataFabric_.
+
+> Please note, that we have also defined an `id` field in `Result` with `alias="$id"`. Noramlly
+a result is attached as an _aspect_ to the _Job_ record. However, if the result includes an
+`$id` field, the result is attached to the entitiy URN identified by that field. In this case,
+it is the URN of the source document. Which in turn, allowed us to easily find previous
+conversions (see [Step 1](#step1))
+
+```python
+# 5. Return the URI of the artifact containing the markdown conversion
+result = Result(id=req.document, markdown_urn=cart.urn, policy=req.policy)
+return result
+```
 
 ## Deploying to Platform
 
@@ -108,98 +159,3 @@ All this can be accomplished with a single command:
 ```
 poetry ivcap deploy
 ```
-
-
-### Test deployed Service
-
-Run `poetry ivcap job-exec tests/request.json` to execute the service to check if '997' is a prime number (`{"number": 997}`):
-
-```
-% poetry ivcap job-exec tests/request.json
-...
-Creating job 'https://develop.ivcap.net/1/services2/urn:ivcap:service:3c51bd86-..../jobs'
-{
-  "$schema": "urn:sd:schema.is-prime.1",
-  "is_prime": true,
-  "number": 997
-}
-```
-
-## Implementation <a name="implementation"></a>
-
-### [tool-service.py](./tool-service.py)
-
-Implements a simple http based service which provides a `POST /` service endpoint to test
-if the number contained in the request is a prime number or not.
-
-We first import a few library functionss and configure the logging system to use a more "machine" friendly format to simplify service monitoring on the platform.
-
-```
-import math
-from pydantic import BaseModel, Field
-from pydantic import BaseModel, ConfigDict
-
-from ivcap_service import getLogger, Service
-from ivcap_ai_tool import start_tool_server, ToolOptions, ivcap_ai_tool, logging_init
-
-logging_init()
-logger = getLogger("app")
-```
-
-We then describe the service, who to contact and other useful information used whne deploying the service
-
-```
-service = Service(
-    name="AI tool to check for prime numbers",
-    contact={
-        "name": "Max Ott",
-        "email": "max.ott@data61.csiro.au",
-    },
-    license={
-        "name": "MIT",
-        "url": "https://opensource.org/license/MIT",
-    },
-)
-```
-
-The core function of the tool itself is accessible as `POST /`. The service signature should be kept as simple as possible.
-We highly recommend defining the input as well as the result by a single `pydantic` model, respectively.
-However, for a tool to be properly used by an Agent, we should provide a
-comprehensive function documentation including the required parameters as well as the reply.
-
-Please also note the `@ivcap_ai_tool` decorator. It exposes the service via `POST \`, but also a `GET /`
-to allow the platform to obtain the tool description which can be used by agents to select the right
-tool but also understand on how to use it.
-
-```
-class Request(BaseModel):
-    jschema: str = Field("urn:sd:schema:is-prime.request.1", alias="$schema")
-    number: int = Field(description="the number to check if prime")
-
-class Result(BaseModel):
-    jschema: str = Field("urn:sd:schema:is-prime.1", alias="$schema")
-    flag: bool = Field(description="true if number is prime, false otherwise")
-
-@ivcap_ai_tool("/", opts=ToolOptions(tags=["Prime Checker"]))
-def is_prime(req: Request) -> Result:
-    """
-    Checks if a number is a prime number.
-    """
-    ...
-    return Result(flag=True)
-```
-
-Finally, we need to start the server
-to listen for incoming requests:
-
-```
-# Start server
-if __name__ == "__main__":
-    start_tool_server(service)
-```
-
-## [resources.json](./resources.json)
-
-This file contains the resource requirements for this tool. This will depend on the computational and memory
-requirements for the specific tool. If it is not provided a default will be used which is likely very similar
-to this file.

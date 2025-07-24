@@ -25,4 +25,7 @@ docker-build:
 docker-run:
 	poetry ivcap docker-run -- --port ${PORT}
 
+deploy:
+	poetry ivcap deploy
+
 .PHONY: run
